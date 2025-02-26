@@ -157,6 +157,9 @@ fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) 
                     response::encode_error(e, &mut rsp_buf);
                 }
             }
+
+            req_buf.clear();
+
             // here need to use no_delay tcp option
             // nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
         }
