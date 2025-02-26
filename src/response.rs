@@ -24,7 +24,7 @@ struct StatusMessage {
 
 impl<'a> Response<'a> {
     pub(crate) fn new(rsp_buf: &'a mut BytesMut) -> Response<'a> {
-        let headers: [&'static str; 16] = [""; 16];
+        let headers: [&'static str; 32] = [""; 32];
 
         Response {
             headers,

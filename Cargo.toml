@@ -14,13 +14,13 @@ license = "MIT/Apache-2.0"
 
 [dependencies]
 log = "0.4"
-itoa = "1"
-bytes = "1"
-httpdate = "1"
-httparse = "1"
-once_cell = "1"
+itoa = "*"
+bytes = "*"
+httpdate = "*"
+httparse = "*"
+once_cell = "*"
 
-may = { version = "0.3.46", default-features = false }
+may = { path = "../may", default-features = false }
 
 [dev-dependencies]
 atoi = "2"

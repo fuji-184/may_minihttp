@@ -2,7 +2,7 @@ use std::fmt;
 use std::io::{self, BufRead, Read};
 use std::mem::MaybeUninit;
 
-pub(crate) const MAX_HEADERS: usize = 64;
+pub(crate) const MAX_HEADERS: usize = 32;
 
 use bytes::{Buf, BufMut, BytesMut};
 use may::net::TcpStream;
@@ -130,6 +130,7 @@ impl<'buf, 'stream> Request<'buf, '_, 'stream> {
                 break;
             }
         }
+        println!("content-length : {}", len);
         len
     }
 }
@@ -149,6 +150,12 @@ pub fn decode<'header, 'buf, 'stream>(
     // safety: don't hold the reference of req_buf
     // so we can transfer the mutable reference to Request
     let buf: &[u8] = unsafe { std::mem::transmute(req_buf.chunk()) };
+
+
+    if !buf.windows(4).any(|window| window == b"\r\n\r\n") {
+        return Ok(None);
+    }
+
     let status = match req.parse_with_uninit_headers(buf, headers) {
         Ok(s) => s,
         Err(e) => {
