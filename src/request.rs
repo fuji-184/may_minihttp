@@ -2,7 +2,7 @@ use std::fmt;
 use std::io::{self, BufRead, Read};
 use std::mem::MaybeUninit;
 
-pub(crate) const MAX_HEADERS: usize = 16;
+pub(crate) const MAX_HEADERS: usize = 64;
 
 use bytes::{Buf, BufMut, BytesMut};
 use may::net::TcpStream;
