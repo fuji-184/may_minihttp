@@ -20,7 +20,7 @@ httpdate = "*"
 httparse = "*"
 once_cell = "*"
 
-may = { path = "../may", default-features = false }
+may = { git = "https://github.com/fuji-184/may.git", default-features = false }
 
 [dev-dependencies]
 atoi = "2"
