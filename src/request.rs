@@ -151,10 +151,11 @@ pub fn decode<'header, 'buf, 'stream>(
     // so we can transfer the mutable reference to Request
     let buf: &[u8] = unsafe { std::mem::transmute(req_buf.chunk()) };
 
-
-    if !buf.windows(4).any(|window| window == b"\r\n\r\n") {
-        return Ok(None);
-    }
+    /*
+        if !buf.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(None);
+        }
+    */
 
     let status = match req.parse_with_uninit_headers(buf, headers) {
         Ok(s) => s,
