@@ -130,7 +130,6 @@ impl<'buf, 'stream> Request<'buf, '_, 'stream> {
                 break;
             }
         }
-        println!("content-length : {}", len);
         len
     }
 }
