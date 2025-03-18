@@ -1,0 +1,510 @@
+//! http server implementation on top of `MAY`
+
+use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
+use std::net::ToSocketAddrs;
+
+use crate::request::{self, Request};
+use crate::response::{self, Response};
+
+#[cfg(unix)]
+use bytes::Buf;
+use bytes::{BufMut, BytesMut};
+#[cfg(unix)]
+use may::io::WaitIo;
+use may::net::{TcpListener, TcpStream};
+use may::{coroutine, go};
+use tungstenite::accept;
+use tungstenite::WebSocket;
+use base64::{engine::general_purpose, Engine as _};
+use sha1::{Digest, Sha1};
+
+macro_rules! t_c {
+    ($e: expr) => {
+        match $e {
+            Ok(val) => val,
+            Err(err) => {
+                error!("call = {:?}\nerr = {:?}", stringify!($e), err);
+                continue;
+            }
+        }
+    };
+}
+
+/// the http service trait
+/// user code should supply a type that impl the `call` method for the http server
+///
+pub trait HttpService {
+    fn call(&mut self, req: Request, rsp: &mut Response) -> io::Result<()>;
+}
+
+pub trait HttpServiceFactory: Send + Sized + 'static {
+    type Service: HttpService + Send;
+    // create a new http service for each connection
+    fn new_service(&self, id: usize) -> Self::Service;
+
+    /// Spawns the http service, binding to the given address
+    /// return a coroutine that you can cancel it when need to stop the service
+    fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
+        let listener = TcpListener::bind(addr)?;
+        go!(
+            coroutine::Builder::new().name("TcpServerFac".to_owned()),
+            move || {
+                #[cfg(unix)]
+                use std::os::fd::AsRawFd;
+                #[cfg(windows)]
+                use std::os::windows::io::AsRawSocket;
+                for stream in listener.incoming() {
+
+
+                    let mut stream = t_c!(stream);
+                    #[cfg(unix)]
+                    let id = stream.as_raw_fd() as usize;
+                    #[cfg(windows)]
+                    let id = stream.as_raw_socket() as usize;
+                    // t_c!(stream.set_nodelay(true));
+                    let service = self.new_service(id);
+                    let builder = may::coroutine::Builder::new().id(id);
+                    go!(
+                        builder,
+                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                            error!("service err = {:?}", e);
+                            stream.shutdown(std::net::Shutdown::Both).ok();
+                        }
+                    )
+                    .unwrap();
+
+
+
+                }
+            }
+
+
+
+        )
+    }
+}
+
+#[inline]
+#[cold]
+pub(crate) fn err<T>(e: io::Error) -> io::Result<T> {
+    Err(e)
+}
+
+#[cfg(unix)]
+#[inline]
+fn nonblock_read(stream: &mut impl Read, req_buf: &mut BytesMut) -> io::Result<bool> {
+    reserve_buf(req_buf);
+    let read_buf: &mut [u8] = unsafe { std::mem::transmute(req_buf.chunk_mut()) };
+    let len = read_buf.len();
+
+    let mut read_cnt = 0;
+    while read_cnt < len {
+        match stream.read(unsafe { read_buf.get_unchecked_mut(read_cnt..) }) {
+            Ok(0) => return err(io::Error::new(io::ErrorKind::BrokenPipe, "read closed")),
+            Ok(n) => read_cnt += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return err(e),
+        }
+    }
+
+    unsafe { req_buf.advance_mut(read_cnt) };
+    Ok(read_cnt < len)
+}
+
+#[cfg(unix)]
+#[inline]
+fn nonblock_write(stream: &mut impl Write, rsp_buf: &mut BytesMut) -> io::Result<usize> {
+    let write_buf = rsp_buf.chunk();
+    let len = write_buf.len();
+    let mut write_cnt = 0;
+    while write_cnt < len {
+        match stream.write(unsafe { write_buf.get_unchecked(write_cnt..) }) {
+            Ok(0) => return err(io::Error::new(io::ErrorKind::BrokenPipe, "write closed")),
+            Ok(n) => write_cnt += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return err(e),
+        }
+    }
+    rsp_buf.advance(write_cnt);
+    Ok(write_cnt)
+}
+
+const BUF_LEN: usize = 4096 * 8;
+#[inline]
+pub(crate) fn reserve_buf(buf: &mut BytesMut) {
+    let rem = buf.capacity() - buf.len();
+    if rem < 1024 {
+        buf.reserve(BUF_LEN - rem);
+    }
+}
+
+
+fn is_websocket_upgrade(req: &Request) -> bool {
+    // Periksa apakah ada header Connection dengan nilai 'upgrade' (case-insensitive)
+    let has_connection_upgrade = req.headers().iter()
+        .any(|h| h.name.eq_ignore_ascii_case("Connection") &&
+             h.value.windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade")));
+
+    // Periksa apakah ada header Upgrade dengan nilai 'websocket' (case-insensitive)
+    let has_upgrade_websocket = req.headers().iter()
+        .any(|h| h.name.eq_ignore_ascii_case("Upgrade") &&
+             h.value.eq_ignore_ascii_case(b"websocket"));
+
+    // Periksa apakah ada header Sec-WebSocket-Key
+    let has_websocket_key = req.headers().iter()
+        .any(|h| h.name.eq_ignore_ascii_case("Sec-WebSocket-Key"));
+
+    has_connection_upgrade && has_upgrade_websocket && has_websocket_key
+}
+
+fn handle_websocket_manually(stream: &mut TcpStream, ws_key: &str) -> io::Result<()> {
+  //  println!("Performing manual WebSocket handshake...");
+
+    // Calculate the WebSocket accept key
+    // As per RFC 6455, we need to append the magic string and compute SHA-1
+    let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut hasher = Sha1::new();
+    hasher.update(ws_key);
+    hasher.update(magic_string);
+    let result = hasher.finalize();
+    let accept_key = general_purpose::STANDARD.encode(result);
+
+    // Prepare handshake response
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        accept_key
+    );
+
+    // Send the handshake response
+    stream.write_all(response.as_bytes())?;
+    //println!("WebSocket handshake response sent!");
+
+    // Now handle the WebSocket frames
+    handle_websocket_frames(stream)
+}
+
+fn handle_websocket_frames(stream: &mut TcpStream) -> io::Result<()> {
+    let mut buffer = [0; 1024];
+
+    loop {
+        // Basic WebSocket frame parsing
+        // This is a simplified implementation and should be expanded for production use
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+      //          println!("WebSocket connection closed");
+                return Ok(());
+            }
+            Ok(n) => {
+                // Very basic frame parsing
+                if n < 2 {
+                    continue;
+                }
+
+                let fin = (buffer[0] & 0x80) != 0;
+                let opcode = buffer[0] & 0x0F;
+                let masked = (buffer[1] & 0x80) != 0;
+                let mut payload_len = (buffer[1] & 0x7F) as usize;
+                let mut mask_offset = 2;
+
+                // Handle extended payload length
+                if payload_len == 126 {
+                    if n < 4 {
+                        continue;
+                    }
+                    payload_len = ((buffer[2] as usize) << 8) | (buffer[3] as usize);
+                    mask_offset = 4;
+                } else if payload_len == 127 {
+                    if n < 10 {
+                        continue;
+                    }
+                    // 64-bit length - simplified here
+                    payload_len = ((buffer[8] as usize) << 8) | (buffer[9] as usize);
+                    mask_offset = 10;
+                }
+
+                // Get masking key if frame is masked
+                let masking_key = if masked {
+                    if n < mask_offset + 4 {
+                        continue;
+                    }
+                    Some([
+                        buffer[mask_offset],
+                        buffer[mask_offset + 1],
+                        buffer[mask_offset + 2],
+                        buffer[mask_offset + 3],
+                    ])
+                } else {
+                    None
+                };
+
+                let data_offset = if masked { mask_offset + 4 } else { mask_offset };
+
+                // Ensure we have enough data
+                if n < data_offset + payload_len {
+                    continue;
+                }
+
+                // Process based on opcode
+                match opcode {
+                    0x1 => { // Text frame
+                        let mut payload = Vec::with_capacity(payload_len);
+                        for i in 0..payload_len {
+                            let byte = buffer[data_offset + i];
+                            if let Some(mask) = masking_key {
+                                payload.push(byte ^ mask[i % 4]);
+                            } else {
+                                payload.push(byte);
+                            }
+                        }
+
+                        // Convert payload to string and echo back
+                        if let Ok(text) = String::from_utf8(payload) {
+        //                    println!("Received text: {}", text);
+                            send_text_frame(stream, &text)?;
+                        }
+                    },
+                    0x2 => { // Binary frame
+          //              println!("Received binary data of {} bytes", payload_len);
+                        // Echo binary data back
+                        let mut payload = Vec::with_capacity(payload_len);
+                        for i in 0..payload_len {
+                            let byte = buffer[data_offset + i];
+                            if let Some(mask) = masking_key {
+                                payload.push(byte ^ mask[i % 4]);
+                            } else {
+                                payload.push(byte);
+                            }
+                        }
+                        send_binary_frame(stream, &payload)?;
+                    },
+                    0x8 => { // Close frame
+            //            println!("Received close frame");
+                        // Send close frame back
+                        let mut response = vec![0x88, 0x00]; // FIN + Close opcode, zero length
+                        stream.write_all(&response)?;
+                        return Ok(());
+                    },
+                    0x9 => { // Ping
+              //          println!("Received ping");
+                        // Send pong
+                        let mut response = vec![0x8A, 0x00]; // FIN + Pong opcode, zero length
+                        stream.write_all(&response)?;
+                    },
+                    _ => {
+                        println!("Received unhandled opcode: {}", opcode);
+                    }
+                }
+            },
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // For non-blocking IO - would need to wait for more data
+                stream.wait_io();
+            },
+            Err(e) => {
+                //eprintln!("Error reading WebSocket frame: {:?}", e);
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn send_text_frame(stream: &mut TcpStream, text: &str) -> io::Result<()> {
+    let data = text.as_bytes();
+    let len = data.len();
+
+    let mut frame = Vec::with_capacity(len + 10);
+
+    // First byte: FIN bit (1) + opcode (1 for text)
+    frame.push(0x81);
+
+    // Second byte: mask bit (0) + payload length
+    if len < 126 {
+        frame.push(len as u8);
+    } else if len < 65536 {
+        frame.push(126);
+        frame.push((len >> 8) as u8);
+        frame.push(len as u8);
+    } else {
+        frame.push(127);
+        // 64-bit length - simplified here
+        frame.push(0); frame.push(0); frame.push(0); frame.push(0);
+        frame.push((len >> 24) as u8);
+        frame.push((len >> 16) as u8);
+        frame.push((len >> 8) as u8);
+        frame.push(len as u8);
+    }
+
+    // Payload data (no masking)
+    frame.extend_from_slice(data);
+
+    stream.write_all(&frame)?;
+  //  println!("Sent text response: {}", text);
+    Ok(())
+}
+
+fn send_binary_frame(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
+    let len = data.len();
+
+    let mut frame = Vec::with_capacity(len + 10);
+
+    // First byte: FIN bit (1) + opcode (2 for binary)
+    frame.push(0x82);
+
+    // Second byte: mask bit (0) + payload length
+    if len < 126 {
+        frame.push(len as u8);
+    } else if len < 65536 {
+        frame.push(126);
+        frame.push((len >> 8) as u8);
+        frame.push(len as u8);
+    } else {
+        frame.push(127);
+        // 64-bit length - simplified here
+        frame.push(0); frame.push(0); frame.push(0); frame.push(0);
+        frame.push((len >> 24) as u8);
+        frame.push((len >> 16) as u8);
+        frame.push((len >> 8) as u8);
+        frame.push(len as u8);
+    }
+
+    // Payload data (no masking)
+    frame.extend_from_slice(data);
+
+    stream.write_all(&frame)?;
+    //println!("Sent binary response of {} bytes", len);
+    Ok(())
+}
+
+
+/// this is the generic type http server
+/// with a type parameter that impl `HttpService` trait
+///
+pub struct HttpServer<T>(pub T);
+
+#[cfg(unix)]
+fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) -> io::Result<()> {
+    let mut req_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut body_buf = BytesMut::with_capacity(4096);
+
+    loop {
+        let read_blocked = nonblock_read(stream.inner_mut(), &mut req_buf)?;
+
+        // prepare the requests, we should make sure the request is fully read
+        loop {
+            let mut headers = [MaybeUninit::uninit(); request::MAX_HEADERS];
+            let req = match request::decode(&mut headers, &mut req_buf, stream)? {
+                Some(req) => req,
+                None => break,
+            };
+
+            if is_websocket_upgrade(&req) {
+      //          println!("WebSocket upgrade detected");
+
+                // Get the WebSocket key
+                let ws_key = req.headers().iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("Sec-WebSocket-Key"))
+                    .map(|h| String::from_utf8_lossy(&h.value).to_string());
+
+                if let Some(key) = ws_key {
+                    // Perform manual handshake
+                    return handle_websocket_manually(stream, &key);
+                } else {
+        //            eprintln!("Missing WebSocket key in upgrade request");
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Missing WebSocket key"));
+                }
+            }
+
+            reserve_buf(&mut rsp_buf);
+            let mut rsp = Response::new(&mut body_buf);
+            match service.call(req, &mut rsp) {
+                Ok(()) => response::encode(rsp, &mut rsp_buf),
+                Err(e) => {
+          //          eprintln!("service err = {:?}", e);
+                    response::encode_error(e, &mut rsp_buf);
+                }
+            }
+
+            req_buf.clear();
+
+            // here need to use no_delay tcp option
+            // nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+        }
+
+        // write out the responses
+        nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+
+        if read_blocked {
+            stream.wait_io();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) -> io::Result<()> {
+    let mut req_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut body_buf = BytesMut::with_capacity(BUF_LEN);
+    loop {
+        // read the socket for requests
+        reserve_buf(&mut req_buf);
+        let read_buf: &mut [u8] = unsafe { std::mem::transmute(&mut *req_buf.chunk_mut()) };
+        let read_cnt = stream.read(read_buf)?;
+        if read_cnt == 0 {
+            //connection was closed
+            return err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+        }
+        unsafe { req_buf.advance_mut(read_cnt) };
+
+        // prepare the requests
+        if read_cnt > 0 {
+            loop {
+                let mut headers = [MaybeUninit::uninit(); request::MAX_HEADERS];
+                let req = match request::decode(&mut headers, &mut req_buf, stream)? {
+                    Some(req) => req,
+                    None => break,
+                };
+                let mut rsp = Response::new(&mut body_buf);
+                match service.call(req, &mut rsp) {
+                    Ok(()) => response::encode(rsp, &mut rsp_buf),
+                    Err(e) => {
+            //            eprintln!("service err = {:?}", e);
+                        response::encode_error(e, &mut rsp_buf);
+                    }
+                }
+                req_buf.clear();
+            }
+        }
+
+        // send the result back to client
+        stream.write_all(&rsp_buf)?;
+    }
+}
+
+impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
+    /// Spawns the http service, binding to the given address
+    /// return a coroutine that you can cancel it when need to stop the service
+    pub fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
+        let listener = TcpListener::bind(addr)?;
+        let service = self.0;
+        go!(
+            coroutine::Builder::new().name("TcpServer".to_owned()),
+            move || {
+                for stream in listener.incoming() {
+                    let mut stream = t_c!(stream);
+                    // t_c!(stream.set_nodelay(true));
+                    let service = service.clone();
+                    go!(
+                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                            error!("service err = {:?}", e);
+                            stream.shutdown(std::net::Shutdown::Both).ok();
+                        }
+                    );
+                }
+            }
+        )
+    }
+}

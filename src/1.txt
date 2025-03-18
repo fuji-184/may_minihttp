@@ -1,0 +1,519 @@
+//! http server implementation on top of `MAY`
+
+use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
+use std::net::ToSocketAddrs;
+
+use crate::request::{self, Request};
+use crate::response::{self, Response};
+
+#[cfg(unix)]
+use bytes::Buf;
+use bytes::{BufMut, BytesMut};
+#[cfg(unix)]
+use may::io::WaitIo;
+use may::net::{TcpListener, TcpStream};
+use may::{coroutine, go};
+use tungstenite::accept;
+use tungstenite::WebSocket;
+use base64::{engine::general_purpose, Engine as _};
+use sha1::{Digest, Sha1};
+
+macro_rules! t_c {
+    ($e: expr) => {
+        match $e {
+            Ok(val) => val,
+            Err(err) => {
+                error!("call = {:?}\nerr = {:?}", stringify!($e), err);
+                continue;
+            }
+        }
+    };
+}
+
+/// the http service trait
+/// user code should supply a type that impl the `call` method for the http server
+///
+pub trait HttpService {
+    fn call(&mut self, req: Request, rsp: &mut Response) -> io::Result<()>;
+}
+
+pub trait HttpServiceFactory: Send + Sized + 'static {
+    type Service: HttpService + Send;
+    // create a new http service for each connection
+    fn new_service(&self, id: usize) -> Self::Service;
+
+    /// Spawns the http service, binding to the given address
+    /// return a coroutine that you can cancel it when need to stop the service
+    fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
+        let listener = TcpListener::bind(addr)?;
+        go!(
+            coroutine::Builder::new().name("TcpServerFac".to_owned()),
+            move || {
+                #[cfg(unix)]
+                use std::os::fd::AsRawFd;
+                #[cfg(windows)]
+                use std::os::windows::io::AsRawSocket;
+                for stream in listener.incoming() {
+
+
+                    let mut stream = t_c!(stream);
+                    #[cfg(unix)]
+                    let id = stream.as_raw_fd() as usize;
+                    #[cfg(windows)]
+                    let id = stream.as_raw_socket() as usize;
+                    // t_c!(stream.set_nodelay(true));
+                    let service = self.new_service(id);
+                    let builder = may::coroutine::Builder::new().id(id);
+                    go!(
+                        builder,
+                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                            error!("service err = {:?}", e);
+                            stream.shutdown(std::net::Shutdown::Both).ok();
+                        }
+                    )
+                    .unwrap();
+
+
+
+                }
+            }
+
+
+
+        )
+    }
+}
+
+#[inline]
+#[cold]
+pub(crate) fn err<T>(e: io::Error) -> io::Result<T> {
+    Err(e)
+}
+
+#[cfg(unix)]
+#[inline]
+fn nonblock_read(stream: &mut impl Read, req_buf: &mut BytesMut) -> io::Result<bool> {
+    reserve_buf(req_buf);
+    let read_buf: &mut [u8] = unsafe { std::mem::transmute(req_buf.chunk_mut()) };
+    let len = read_buf.len();
+
+    let mut read_cnt = 0;
+    while read_cnt < len {
+        match stream.read(unsafe { read_buf.get_unchecked_mut(read_cnt..) }) {
+            Ok(0) => return err(io::Error::new(io::ErrorKind::BrokenPipe, "read closed")),
+            Ok(n) => read_cnt += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return err(e),
+        }
+    }
+
+    unsafe { req_buf.advance_mut(read_cnt) };
+    Ok(read_cnt < len)
+}
+
+#[cfg(unix)]
+#[inline]
+fn nonblock_write(stream: &mut impl Write, rsp_buf: &mut BytesMut) -> io::Result<usize> {
+    let write_buf = rsp_buf.chunk();
+    let len = write_buf.len();
+    let mut write_cnt = 0;
+    while write_cnt < len {
+        match stream.write(unsafe { write_buf.get_unchecked(write_cnt..) }) {
+            Ok(0) => return err(io::Error::new(io::ErrorKind::BrokenPipe, "write closed")),
+            Ok(n) => write_cnt += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return err(e),
+        }
+    }
+    rsp_buf.advance(write_cnt);
+    Ok(write_cnt)
+}
+
+const BUF_LEN: usize = 4096 * 8;
+#[inline]
+pub(crate) fn reserve_buf(buf: &mut BytesMut) {
+    let rem = buf.capacity() - buf.len();
+    if rem < 1024 {
+        buf.reserve(BUF_LEN - rem);
+    }
+}
+
+fn is_websocket_upgrade(req: &Request) -> bool {
+    // Periksa header Connection: upgrade
+    let has_connection_upgrade = req.headers().iter()
+        .any(|h| h.name.eq_ignore_ascii_case("Connection") &&
+             h.value.windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade")));
+
+    // Periksa header Upgrade: websocket
+    let has_upgrade_websocket = req.headers().iter()
+        .any(|h| h.name.eq_ignore_ascii_case("Upgrade") &&
+             h.value.eq_ignore_ascii_case(b"websocket"));
+
+    // Periksa Sec-WebSocket-Key
+    let has_websocket_key = req.headers().iter()
+        .any(|h| h.name.eq_ignore_ascii_case("Sec-WebSocket-Key"));
+
+    has_connection_upgrade && has_upgrade_websocket && has_websocket_key
+}
+
+fn get_websocket_key<'a>(req: &'a Request<'a, 'a, 'a>) -> Option<&'a [u8]> {
+    req.headers().iter()
+        .find(|h| h.name.eq_ignore_ascii_case("Sec-WebSocket-Key"))
+        .map(|h| &h.value[..])
+}
+
+fn handle_websocket_upgrade(stream: &mut TcpStream, key: &[u8]) -> io::Result<()> {
+
+    // Magic string sesuai RFC 6455
+    const MAGIC_STRING: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+    // Prealokasi buffer untuk kombinasi key + magic (hindari alokasi dinamis)
+    let mut key_buffer = [0u8; 128];
+    let mut key_len = 0;
+
+    // Copy WebSocket key ke buffer
+    for &byte in key {
+        if key_len < key_buffer.len() {
+            key_buffer[key_len] = byte;
+            key_len += 1;
+        }
+    }
+
+    // Copy magic string ke buffer
+    for &byte in MAGIC_STRING {
+        if key_len < key_buffer.len() {
+            key_buffer[key_len] = byte;
+            key_len += 1;
+        }
+    }
+
+    // Hitung SHA-1 hash (tanpa alokasi tambahan)
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(&key_buffer[..key_len]);
+    let hash_result = hasher.finalize();
+
+    // Prealokasi buffer respons untuk menghindari alokasi dinamis
+    let mut response_buffer = [0u8; 256];
+    let mut response_len = 0;
+
+    // Tulis header respons
+    let resp_header = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ";
+    for &byte in resp_header {
+        response_buffer[response_len] = byte;
+        response_len += 1;
+    }
+
+    // Encode Base64 langsung ke buffer (hindari alokasi string)
+    let encoded_len = base64_encode(&hash_result, &mut response_buffer[response_len..]);
+    response_len += encoded_len;
+
+    // Tambahkan CRLF di akhir header
+    for &byte in b"\r\n\r\n" {
+        response_buffer[response_len] = byte;
+        response_len += 1;
+    }
+
+    // Kirim respons handshake
+    stream.write_all(&response_buffer[..response_len])?;
+
+    // Sekarang proses frame-frame WebSocket
+    process_websocket_frames(stream)
+}
+
+// Base64 encoding tanpa alokasi
+fn base64_encode(input: &[u8], output: &mut [u8]) -> usize {
+    const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out_idx = 0;
+
+    for i in (0..input.len()).step_by(3) {
+        let b1 = input[i];
+        let b2 = if i + 1 < input.len() { input[i + 1] } else { 0 };
+        let b3 = if i + 2 < input.len() { input[i + 2] } else { 0 };
+
+        output[out_idx] = BASE64_CHARS[(b1 >> 2) as usize]; out_idx += 1;
+        output[out_idx] = BASE64_CHARS[(((b1 & 0x03) << 4) | (b2 >> 4)) as usize]; out_idx += 1;
+
+        if i + 1 < input.len() {
+            output[out_idx] = BASE64_CHARS[(((b2 & 0x0F) << 2) | (b3 >> 6)) as usize]; out_idx += 1;
+        } else {
+            output[out_idx] = b'='; out_idx += 1;
+        }
+
+        if i + 2 < input.len() {
+            output[out_idx] = BASE64_CHARS[(b3 & 0x3F) as usize]; out_idx += 1;
+        } else {
+            output[out_idx] = b'='; out_idx += 1;
+        }
+    }
+
+    out_idx
+}
+
+// Buffer statis besar untuk menampung frame WebSocket
+static mut WS_BUFFER: [u8; 8192] = [0; 8192];
+
+fn process_websocket_frames(stream: &mut TcpStream) -> io::Result<()> {
+    // Use a larger buffer for high-throughput scenarios
+    let mut buffer = vec![0u8; 16384];
+    let mut frame_buffer = Vec::with_capacity(16384);
+
+    loop {
+        // Read data from stream
+        let n = match stream.read(&mut buffer) {
+            Ok(0) => return Ok(()), // Connection closed
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                stream.wait_io();
+                continue;
+            },
+            Err(e) => return Err(e),
+        };
+
+        // Append to our processing buffer
+        frame_buffer.extend_from_slice(&buffer[..n]);
+
+        // Process frames as long as we have enough data
+        while !frame_buffer.is_empty() {
+            // Ensure we have at least the basic header (2 bytes)
+            if frame_buffer.len() < 2 {
+                break;
+            }
+
+            // Parse basic frame information
+            let fin = (frame_buffer[0] & 0x80) != 0;
+            let opcode = frame_buffer[0] & 0x0F;
+            let masked = (frame_buffer[1] & 0x80) != 0;
+            let payload_len_indicator = frame_buffer[1] & 0x7F;
+
+            // Calculate header size based on payload length
+            let mut header_size = 2;
+            let actual_payload_len;
+
+            if payload_len_indicator == 126 {
+                if frame_buffer.len() < 4 {
+                    break; // Need more data
+                }
+                header_size = 4;
+                actual_payload_len = ((frame_buffer[2] as usize) << 8) | (frame_buffer[3] as usize);
+            } else if payload_len_indicator == 127 {
+                if frame_buffer.len() < 10 {
+                    break; // Need more data
+                }
+                header_size = 10;
+                let mut len = 0;
+                for i in 2..10 {
+                    len = (len << 8) | (frame_buffer[i] as usize);
+                }
+                actual_payload_len = len;
+            } else {
+                actual_payload_len = payload_len_indicator as usize;
+            }
+
+            // Calculate total frame size
+            let mask_size = if masked { 4 } else { 0 };
+            let total_frame_size = header_size + mask_size + actual_payload_len;
+
+            // Check if we have the complete frame
+            if frame_buffer.len() < total_frame_size {
+                break; // Need more data
+            }
+
+            // Process based on opcode
+            match opcode {
+                0x8 => {
+                    // Close frame - send close frame back and close connection
+                    let resp = [0x88, 0x00];
+                    stream.write_all(&resp)?;
+                    return Ok(());
+                },
+                0x9 => {
+                    // Ping - send pong back
+                    let resp = [0x8A, 0x00];
+                    stream.write_all(&resp)?;
+                },
+                0x1 | 0x2 => {
+                    // Text or Binary frame
+                    let data_offset = header_size + mask_size;
+
+                    // Create response frame
+                    let mut response = Vec::with_capacity(10 + actual_payload_len);
+
+                    // FIN bit + original opcode
+                    response.push(0x80 | opcode);
+
+                    // Payload length encoding
+                    if actual_payload_len < 126 {
+                        response.push(actual_payload_len as u8);
+                    } else if actual_payload_len < 65536 {
+                        response.push(126);
+                        response.push((actual_payload_len >> 8) as u8);
+                        response.push(actual_payload_len as u8);
+                    } else {
+                        response.push(127);
+                        for i in (0..8).rev() {
+                            response.push((actual_payload_len >> (i * 8)) as u8);
+                        }
+                    }
+
+                    // Copy and unmask payload if needed
+                    if masked {
+                        // Extract masking key first (before any mutable borrows)
+                        let mask = [
+                            frame_buffer[header_size],
+                            frame_buffer[header_size + 1],
+                            frame_buffer[header_size + 2],
+                            frame_buffer[header_size + 3]
+                        ];
+
+                        // Copy and unmask payload data
+                        for i in 0..actual_payload_len {
+                            let payload_byte = frame_buffer[data_offset + i] ^ mask[i % 4];
+                            response.push(payload_byte);
+                        }
+                    } else {
+                        // Just copy payload
+                        response.extend_from_slice(&frame_buffer[data_offset..data_offset + actual_payload_len]);
+                    }
+
+                    // Send response
+                    stream.write_all(&response)?;
+                },
+                _ => {
+                    // Unhandled opcode - ignore
+                }
+            }
+
+            // Remove the processed frame
+            frame_buffer.drain(0..total_frame_size);
+        }
+    }
+}
+/// this is the generic type http server
+/// with a type parameter that impl `HttpService` trait
+///
+pub struct HttpServer<T>(pub T);
+
+#[cfg(unix)]
+fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) -> io::Result<()> {
+    let mut req_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut body_buf = BytesMut::with_capacity(4096);
+
+    loop {
+        let read_blocked = nonblock_read(stream.inner_mut(), &mut req_buf)?;
+
+        // prepare the requests, we should make sure the request is fully read
+        loop {
+            let mut headers = [MaybeUninit::uninit(); request::MAX_HEADERS];
+           match request::decode(&mut headers, &mut req_buf, stream)? {
+    Some(req) => {
+        if is_websocket_upgrade(&req) {
+            // Extract the websocket key and any other needed info
+            let ws_key = get_websocket_key(&req).map(|k| k.to_vec());
+
+            // Now we can clear the buffer and release the borrow
+            req_buf.clear();
+
+            // Handle the upgrade with the copied data if we have the key
+            if let Some(key) = ws_key {
+                return handle_websocket_upgrade(stream, &key);
+            } else {
+                // Handle missing key error
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Missing WebSocket key"));
+            }
+        }
+
+        // Normal HTTP request processing
+        reserve_buf(&mut rsp_buf);
+        let mut rsp = Response::new(&mut body_buf);
+        match service.call(req, &mut rsp) {
+            Ok(()) => response::encode(rsp, &mut rsp_buf),
+            Err(e) => {
+                eprintln!("service err = {:?}", e);
+                response::encode_error(e, &mut rsp_buf);
+            }
+        }
+
+        req_buf.clear();
+    },
+    None => break,
+}
+            // here need to use no_delay tcp option
+            // nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+        }
+
+        // write out the responses
+        nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+
+        if read_blocked {
+            stream.wait_io();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) -> io::Result<()> {
+    let mut req_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut body_buf = BytesMut::with_capacity(BUF_LEN);
+    loop {
+        // read the socket for requests
+        reserve_buf(&mut req_buf);
+        let read_buf: &mut [u8] = unsafe { std::mem::transmute(&mut *req_buf.chunk_mut()) };
+        let read_cnt = stream.read(read_buf)?;
+        if read_cnt == 0 {
+            //connection was closed
+            return err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+        }
+        unsafe { req_buf.advance_mut(read_cnt) };
+
+        // prepare the requests
+        if read_cnt > 0 {
+            loop {
+                let mut headers = [MaybeUninit::uninit(); request::MAX_HEADERS];
+                let req = match request::decode(&mut headers, &mut req_buf, stream)? {
+                    Some(req) => req,
+                    None => break,
+                };
+                let mut rsp = Response::new(&mut body_buf);
+                match service.call(req, &mut rsp) {
+                    Ok(()) => response::encode(rsp, &mut rsp_buf),
+                    Err(e) => {
+                        eprintln!("service err = {:?}", e);
+                        response::encode_error(e, &mut rsp_buf);
+                    }
+                }
+                req_buf.clear();
+            }
+        }
+
+        // send the result back to client
+        stream.write_all(&rsp_buf)?;
+    }
+}
+
+impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
+    /// Spawns the http service, binding to the given address
+    /// return a coroutine that you can cancel it when need to stop the service
+    pub fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
+        let listener = TcpListener::bind(addr)?;
+        let service = self.0;
+        go!(
+            coroutine::Builder::new().name("TcpServer".to_owned()),
+            move || {
+                for stream in listener.incoming() {
+                    let mut stream = t_c!(stream);
+                    // t_c!(stream.set_nodelay(true));
+                    let service = service.clone();
+                    go!(
+                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                            error!("service err = {:?}", e);
+                            stream.shutdown(std::net::Shutdown::Both).ok();
+                        }
+                    );
+                }
+            }
+        )
+    }
+}

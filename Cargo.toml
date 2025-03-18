@@ -21,6 +21,9 @@ httparse = "*"
 once_cell = "*"
 
 may = { version = "*", default-features = false }
+tungstenite = { path = "../tungstenite" }
+base64 = "0.22.1"
+sha1 = "0.10.6"
 
 [dev-dependencies]
 atoi = "2"
