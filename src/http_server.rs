@@ -14,8 +14,6 @@ use bytes::{BufMut, BytesMut};
 use may::io::WaitIo;
 use may::net::{TcpListener, TcpStream};
 use may::{coroutine, go};
-use tungstenite::accept;
-use tungstenite::WebSocket;
 use base64::{engine::general_purpose, Engine as _};
 use sha1::{Digest, Sha1};
 
@@ -43,7 +41,7 @@ pub trait WsService: Send {
     fn on_connect(&mut self, path: &str, ctx: &mut WsContext) -> io::Result<()>;
 
     /// Called when message is received
-    fn on_message(&mut self, opcode: u8, payload: &[u8], ctx: &mut WsContext) -> io::Result<()>;
+    fn on_message(&mut self, stream: &mut TcpStream, opcode: u8, payload: &[u8], ctx: &mut WsContext) -> io::Result<()>;
 
     /// Called when connection is closed
     fn on_close(&mut self, code: u16, reason: &str, ctx: &mut WsContext) -> io::Result<()>;
@@ -51,23 +49,23 @@ pub trait WsService: Send {
 
 // WebSocket context for sending messages
 pub struct WsContext<'a> {
-    stream: &'a mut TcpStream,
-    write_buf: BytesMut,
+    // stream: &'a mut TcpStream,
+    write_buf: &'a mut BytesMut,
 }
 
 impl<'a> WsContext<'a> {
     /// Send text message
-    pub fn send_text(&mut self, text: &str) -> io::Result<()> {
-        self.send_frame(0x1, text.as_bytes())
+    pub fn send_text(&mut self, stream: &mut TcpStream, text: &str) -> io::Result<()> {
+        self.send_frame(stream, 0x1, text.as_bytes())
     }
 
     /// Send binary message
-    pub fn send_binary(&mut self, data: &[u8]) -> io::Result<()> {
-        self.send_frame(0x2, data)
+    pub fn send_binary(&mut self, stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
+        self.send_frame(stream, 0x2, data)
     }
 
     /// Send raw WebSocket frame
-    pub fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+    pub fn send_frame(&mut self, stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> io::Result<()> {
         self.write_buf.clear();
 
         // Build frame header
@@ -88,49 +86,12 @@ impl<'a> WsContext<'a> {
         self.write_buf.extend_from_slice(payload);
 
         // Write to stream
-        self.stream.write_all(&self.write_buf)
-    }
-
-fn with_buf<F>(&mut self, f: F) -> io::Result<()>
-    where
-        F: FnOnce(&mut BytesMut) -> io::Result<()>,
-    {
-        let old_len = self.write_buf.len();
-        f(&mut self.write_buf)?;
-
-        // Tulis ke stream jika ada data baru
-        if self.write_buf.len() > old_len {
-            self.stream.write_all(&self.write_buf[old_len..])?;
-        }
+        let _ = stream.write_all(&self.write_buf);
+        self.write_buf.clear();
         Ok(())
     }
 
-    // Method untuk mengirim pong
-    pub fn send_pong(&mut self, payload: &[u8]) -> io::Result<()> {
-        self.with_buf(|buf| {
-            buf.clear();
-            buf.put_u8(0x8A); // FIN + Pong opcode
 
-            if !payload.is_empty() {
-                // Tulis payload length
-                if payload.len() < 126 {
-                    buf.put_u8(payload.len() as u8);
-                } else if payload.len() < 65536 {
-                    buf.put_u8(126);
-                    buf.put_u16(payload.len() as u16);
-                } else {
-                    buf.put_u8(127);
-                    buf.put_u64(payload.len() as u64);
-                }
-
-                // Salin payload
-                buf.extend_from_slice(payload);
-            } else {
-                buf.put_u8(0x00);
-            }
-            Ok(())
-        })
-    }
 }
 
 pub trait HttpServiceFactory: Send + Sized + 'static {
@@ -294,7 +255,7 @@ fn each_connection_loop<T: HttpService, W: WsService>(stream: &mut TcpStream, mu
 
                                 rsp_buf.clear();
 
-                                return handle_websocket_frames_zero_copy(stream, &mut req_buf, rsp_buf, ws_service, path);
+                                return handle_websocket_frames_zero_copy(stream, &mut req_buf, &mut rsp_buf, ws_service, path);
                             } else {
                                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Could not generate WebSocket accept key"));
                             }
@@ -360,180 +321,203 @@ fn is_websocket_upgrade(req: &Request) -> bool {
 
 fn handle_websocket_frames_zero_copy<W: WsService + Send>(
     stream: &mut TcpStream,
-    mut read_buf: &mut BytesMut,
-    mut write_buf: BytesMut,
+    read_buf: &mut BytesMut,
+    write_buf: &mut BytesMut,
     mut ws: W,
-    path: String
+    path: String,
 ) -> io::Result<()> {
-
     let mut ctx = WsContext {
-        stream,
-        write_buf: write_buf,
+        write_buf,
     };
 
-    // Call on_connect handler
+    // Call on_connect callback
     ws.on_connect(&path, &mut ctx)?;
 
-    read_buf.clear();
-
     loop {
-let mut offset = 0;
+        // Read data
+        let read_blocked = nonblock_read2(stream, read_buf)?;
+        // Process frames
+        let mut offset = 0;
 
+        // Make sure we have enough data for at least a basic header
         while offset + 2 <= read_buf.len() {
-            // Parse header
             let header_start = offset;
-            let fin = (read_buf[header_start] & 0x80) != 0;
-            let opcode = read_buf[header_start] & 0x0F;
-            let masked = (read_buf[header_start + 1] & 0x80) != 0;
-            let payload_len_byte = read_buf[header_start + 1] & 0x7F;
 
-            // Hitung payload_len dan header_size
-            let (payload_len, header_size) = match payload_len_byte {
-                126 => {
-                    if header_start + 4 > read_buf.len() {
-                        break;
-                    }
-                    let len = ((read_buf[header_start + 2] as u16) << 8) |
-                             (read_buf[header_start + 3] as u16);
-                    (len as usize, 4)
-                },
-                127 => {
-                    if header_start + 10 > read_buf.len() {
-                        break;
-                    }
-                    let len = ((read_buf[header_start + 2] as u64) << 56) |
-                             ((read_buf[header_start + 3] as u64) << 48) |
-                             ((read_buf[header_start + 4] as u64) << 40) |
-                             ((read_buf[header_start + 5] as u64) << 32) |
-                             ((read_buf[header_start + 6] as u64) << 24) |
-                             ((read_buf[header_start + 7] as u64) << 16) |
-                             ((read_buf[header_start + 8] as u64) << 8)  |
-                             (read_buf[header_start + 9] as u64);
-                    (len as usize, 10)
-                },
-                n => (n as usize, 2),
+            // Debug bounds check
+            if header_start >= read_buf.len() {
+               break;
+            }
+
+            let first_byte = read_buf[header_start];
+
+            // Debug bounds check
+            if header_start + 1 >= read_buf.len() {
+               break;
+            }
+
+            let second_byte = read_buf[header_start + 1];
+
+            let fin = (first_byte & 0x80) != 0;
+            let opcode = first_byte & 0x0F;
+            let masked = (second_byte & 0x80) != 0;
+            let payload_len_byte = second_byte & 0x7F;
+
+            // Calculate how many additional bytes we need for header
+            let additional_header_bytes = match payload_len_byte {
+                126 => 2,  // 16-bit length
+                127 => 8,  // 64-bit length
+                _ => 0     // length is in the payload_len_byte
             };
 
-            // Hitung mask_offset dan payload_offset
+            // Check if we have enough bytes for the complete header
+            if header_start + 2 + additional_header_bytes > read_buf.len() {
+               break;  // Not enough data, wait for more
+            }
+
+            // Parse the payload length safely
+            let (payload_len, header_size) = match payload_len_byte {
+                126 => {
+                    let len = u16::from_be_bytes([
+                        read_buf[header_start + 2],
+                        read_buf[header_start + 3]
+                    ]) as usize;
+                    (len, 4)
+                }
+                127 => {
+                    let len = u64::from_be_bytes([
+                        read_buf[header_start + 2],
+                        read_buf[header_start + 3],
+                        read_buf[header_start + 4],
+                        read_buf[header_start + 5],
+                        read_buf[header_start + 6],
+                        read_buf[header_start + 7],
+                        read_buf[header_start + 8],
+                        read_buf[header_start + 9],
+                    ]) as usize;
+                    (len, 10)
+                }
+                len => (len as usize, 2),
+            };
+
+            // Calculate total frame size and check if we have a complete frame
             let mask_offset = header_start + header_size;
-            let payload_offset = mask_offset + if masked { 4 } else { 0 };
-            let total_frame_size = header_size +
-                                 (if masked { 4 } else { 0 }) +
-                                 payload_len;
+            let mask_size = if masked { 4 } else { 0 };
+            let payload_offset = mask_offset + mask_size;
+            let total_frame_size = header_size + mask_size + payload_len;
 
-            // Pastikan frame lengkap
+            // Check if we have the complete frame
             if header_start + total_frame_size > read_buf.len() {
-                break;
+               break;  // Not enough data, wait for more
             }
 
-            // Process the frame based on the opcode
+            // Process the frame based on opcode
             match opcode {
-            0x8 => { // Close frame
-                let mut close_code = 1000u16; // default normal closure
-                let mut close_reason = "";
+                0x1 | 0x2 => {
+                    // Text/Binary frame
+                    // Safely extract and unmask payload
+                    let mut payload_data = Vec::with_capacity(payload_len);
 
-                // Parse close frame payload if present
-                if payload_len >= 2 {
-                    close_code = u16::from_be_bytes(
-                        [read_buf[payload_offset], read_buf[payload_offset + 1]]
-                    );
-                    close_reason = std::str::from_utf8(&read_buf[payload_offset + 2..])
-                        .unwrap_or("");
-                }
+                    if masked {
+                        let mask = [
+                            read_buf[mask_offset],
+                            read_buf[mask_offset + 1],
+                            read_buf[mask_offset + 2],
+                            read_buf[mask_offset + 3],
+                        ];
 
-                // Call on_close handler
-                ws.on_close(close_code, close_reason, &mut ctx)?;
-
-                // Send close response
-                ctx.write_buf.clear();
-                ctx.write_buf.put_u8(0x88); // FIN + Close
-                ctx.write_buf.put_u8(0x00); // Empty payload
-                ctx.stream.write_all(&ctx.write_buf)?;
-                return Ok(());
-            },
-
-
-0x9 => {
-    // Hitung parameter frame
-    let mask_size = if masked { 4 } else { 0 };
-    let payload_offset = offset + header_size + mask_size;
-
-    // Ekstrak payload
-    let payload = if payload_len > 0 {
-        let mut payload_data = Vec::with_capacity(payload_len);
-        if masked {
-            let mask_offset = offset + header_size;
-            let mask = [
-                read_buf[mask_offset],
-                read_buf[mask_offset + 1],
-                read_buf[mask_offset + 2],
-                read_buf[mask_offset + 3],
-            ];
-
-            for i in 0..payload_len {
-                payload_data.push(read_buf[payload_offset + i] ^ mask[i % 4]);
-            }
-        } else {
-            payload_data.extend_from_slice(&read_buf[payload_offset..payload_offset + payload_len]);
-        }
-        Some(payload_data)
-    } else {
-        None
-    };
-
-    // Kirim pong melalui context
-    ctx.send_pong(payload.as_deref().unwrap_or_default())?;
-
-    // Pindah ke frame berikutnya
-    offset += total_frame_size;
-
-    // Keluar dari blok match untuk melepaskan borrow
-    continue;
-},
-                0x1 | 0x2 => { // Text/Binary frame
-                let payload = &read_buf[payload_offset..payload_offset + payload_len];
-
-                // Unmask if needed
-                let mut payload_data = Vec::with_capacity(payload_len);
-                if masked {
-                    let mask = [
-                        read_buf[mask_offset],
-                        read_buf[mask_offset + 1],
-                        read_buf[mask_offset + 2],
-                        read_buf[mask_offset + 3],
-                    ];
-                    for (i, byte) in payload.iter().enumerate() {
-                        payload_data.push(byte ^ mask[i % 4]);
+                        for i in 0..payload_len {
+                            if payload_offset + i < read_buf.len() {
+                                payload_data.push(read_buf[payload_offset + i] ^ mask[i % 4]);
+                            } else {
+                               break;
+                            }
+                        }
+                    } else {
+                        // Copy payload without unmasking
+                        payload_data.extend_from_slice(&read_buf[payload_offset..payload_offset + payload_len]);
                     }
-                } else {
-                    payload_data.extend_from_slice(payload);
+
+                    // Call on_message handler
+                   ws.on_message(stream, opcode, &payload_data, &mut ctx)?;
+                },
+                0x8 => {
+                    // Close frame
+                   let mut code = 1000u16;
+                    let mut reason = "";
+
+                    if payload_len >= 2 {
+                        code = u16::from_be_bytes([
+                            read_buf[payload_offset],
+                            read_buf[payload_offset + 1]
+                        ]);
+
+                        if payload_len > 2 {
+                            reason = std::str::from_utf8(
+                                &read_buf[payload_offset + 2..payload_offset + payload_len]
+                            ).unwrap_or("");
+                        }
+                    }
+
+                    // Call on_close and send response
+                    ws.on_close(code, reason, &mut ctx)?;
+                    ctx.send_frame(stream, 0x8, &[])?;
+                    return Ok(());
+                },
+                0x9 => {
+                    // Ping frame - automatically reply with pong
+                   let payload = &read_buf[payload_offset..payload_offset + payload_len];
+                    ctx.send_frame(stream, 0xA, payload)?;
+                },
+                0xA => {
+                    // Pong frame - nothing to do
+                    ctx.send_text(stream, "pong")?;
+                },
+                _ => {
+                   ctx.send_text(stream, &format!("Unknown opcode: {}", opcode))?;
                 }
-
-                // Call on_message handler
-                ws.on_message(opcode, &payload_data, &mut ctx)?;
-            },               // Ignore other opcodes (continuation frames, etc.)
-                _ => {}
             }
 
-            // Move to next frame
+            // Update offset to point to the next frame
             offset += total_frame_size;
+            }
+
+        // Remove processed data from the buffer
+        if offset > 0 {
+           read_buf.advance(offset);
         }
 
-        // Remove processed frames from buffer
-        if offset > 0 {
-            if offset < read_buf.len() {
-                // Retain unprocessed data - use zero-copy approach when possible
-                read_buf.advance(offset);
-            } else {
-                // All data processed
-                read_buf.clear();
-            }
-        }
+        // Send any pending data
+        //nonblock_write(stream, &mut ctx.write_buf)?;
+
+        // Wait for more data if needed
+        if read_blocked {
+           stream.wait_io();
+           }
     }
 }
 
-
-
+// Improved nonblock_read2 function
+fn nonblock_read2(stream: &mut impl Read, req_buf: &mut BytesMut) -> io::Result<bool> {
+    reserve_buf(req_buf);
+    let read_buf: &mut [u8] = unsafe { std::mem::transmute(req_buf.chunk_mut()) };
+    let capacity = read_buf.len();
+    // Try a single read operation - don't loop
+    match stream.read(read_buf) {
+        Ok(0) => {
+           return err(io::Error::new(io::ErrorKind::BrokenPipe, "read closed"));
+        },
+        Ok(n) => {
+           unsafe { req_buf.advance_mut(n) };
+            return Ok(n < capacity); // Return true if we might have more data to read
+        },
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+           return Ok(true); // We're blocked, signal that we need to wait
+        },
+        Err(e) => {
+           return err(e);
+        }
+    }
+}
 
 #[cfg(not(unix))]
 fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) -> io::Result<()> {
