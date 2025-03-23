@@ -3,16 +3,26 @@ use std::io;
 use crate::request::MAX_HEADERS;
 
 use bytes::BytesMut;
+
 pub struct Response<'a> {
-    headers: [&'static str; MAX_HEADERS],
+    headers: [Header; MAX_HEADERS],
     headers_len: usize,
     status_message: StatusMessage,
     body: Body,
     rsp_buf: &'a mut BytesMut,
+    header_storage: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum Header {
+    Static(&'static str),
+    Owned(usize),
+    Empty,
 }
 
 enum Body {
     Str(&'static str),
+    String(String),
     Vec(Vec<u8>),
     Dummy,
 }
@@ -24,7 +34,7 @@ struct StatusMessage {
 
 impl<'a> Response<'a> {
     pub(crate) fn new(rsp_buf: &'a mut BytesMut) -> Response<'a> {
-        let headers: [&'static str; 32] = [""; 32];
+        let headers = [Header::Empty; 32];
 
         Response {
             headers,
@@ -35,6 +45,7 @@ impl<'a> Response<'a> {
                 msg: "Ok",
             },
             rsp_buf,
+            header_storage: Vec::new(),
         }
     }
 
@@ -46,7 +57,16 @@ impl<'a> Response<'a> {
 
     #[inline]
     pub fn header(&mut self, header: &'static str) -> &mut Self {
-        self.headers[self.headers_len] = header;
+        self.headers[self.headers_len] = Header::Static(header);
+        self.headers_len += 1;
+        self
+    }
+
+    #[inline]
+    pub fn header_str(&mut self, header: String) -> &mut Self {
+        let index = self.header_storage.len();
+        self.header_storage.push(header);
+        self.headers[self.headers_len] = Header::Owned(index);
         self.headers_len += 1;
         self
     }
@@ -57,19 +77,28 @@ impl<'a> Response<'a> {
     }
 
     #[inline]
+    pub fn body_string(&mut self, s: String) {
+        self.body = Body::String(s);
+    }
+
+    #[inline]
     pub fn body_vec(&mut self, v: Vec<u8>) {
         self.body = Body::Vec(v);
     }
 
     #[inline]
     pub fn body_mut(&mut self) -> &mut BytesMut {
-        match self.body {
+        match &self.body {
             Body::Dummy => {}
             Body::Str(s) => {
                 self.rsp_buf.extend_from_slice(s.as_bytes());
                 self.body = Body::Dummy;
             }
-            Body::Vec(ref v) => {
+            Body::String(s) => {
+                self.rsp_buf.extend_from_slice(s.as_bytes());
+                self.body = Body::Dummy;
+            }
+            Body::Vec(v) => {
                 self.rsp_buf.extend_from_slice(v);
                 self.body = Body::Dummy;
             }
@@ -79,19 +108,30 @@ impl<'a> Response<'a> {
 
     #[inline]
     fn body_len(&self) -> usize {
-        match self.body {
+        match &self.body {
             Body::Dummy => self.rsp_buf.len(),
             Body::Str(s) => s.len(),
-            Body::Vec(ref v) => v.len(),
+            Body::String(s) => s.len(),
+            Body::Vec(v) => v.len(),
         }
     }
 
     #[inline]
     fn get_body(&mut self) -> &[u8] {
-        match self.body {
+        match &self.body {
             Body::Dummy => self.rsp_buf.as_ref(),
             Body::Str(s) => s.as_bytes(),
-            Body::Vec(ref v) => v,
+            Body::String(s) => s.as_bytes(),
+            Body::Vec(v) => v,
+        }
+    }
+
+    #[inline]
+    fn get_header(&self, index: usize) -> &str {
+        match &self.headers[index] {
+            Header::Static(s) => s,
+            Header::Owned(idx) => &self.header_storage[*idx],
+            Header::Empty => "",
         }
     }
 }
@@ -119,10 +159,9 @@ pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
     buf.extend_from_slice(length.format(rsp.body_len()).as_bytes());
 
     // SAFETY: we already have bound check when insert headers
-    let headers = unsafe { rsp.headers.get_unchecked(..rsp.headers_len) };
-    for h in headers {
+    for i in 0..rsp.headers_len {
         buf.extend_from_slice(b"\r\n");
-        buf.extend_from_slice(h.as_bytes());
+        buf.extend_from_slice(rsp.get_header(i).as_bytes());
     }
 
     buf.extend_from_slice(b"\r\n\r\n");

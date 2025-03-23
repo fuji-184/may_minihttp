@@ -38,13 +38,13 @@ pub trait HttpService {
 
 pub trait WsService: Send {
     /// Called when WebSocket connection is established
-    fn on_connect(&mut self, stream: &mut TcpStream, path: &str, ctx: &mut WsContext) -> io::Result<()>;
+    fn on_connect(&mut self, stream: &mut TcpStream, ctx: &mut WsContext, path: &str) -> io::Result<()>;
 
     /// Called when message is received
-    fn on_message(&mut self, stream: &mut TcpStream, opcode: u8, payload: &[u8], ctx: &mut WsContext) -> io::Result<()>;
+    fn on_message(&mut self, stream: &mut TcpStream, opcode: u8, payload: &[u8], ctx: &mut WsContext, path: &str) -> io::Result<()>;
 
     /// Called when connection is closed
-    fn on_close(&mut self, stream: &mut TcpStream, code: u16, reason: &str, ctx: &mut WsContext) -> io::Result<()>;
+    fn on_close(&mut self, stream: &mut TcpStream, code: u16, reason: &str, ctx: &mut WsContext, path: &str) -> io::Result<()>;
 }
 
 // WebSocket context for sending messages
@@ -331,7 +331,7 @@ fn handle_websocket_frames_zero_copy<W: WsService + Send>(
     };
 
     // Call on_connect callback
-    ws.on_connect(stream, &path, &mut ctx)?;
+    ws.on_connect(stream, &mut ctx, &path)?;
 
     loop {
         // Read data
@@ -438,7 +438,7 @@ fn handle_websocket_frames_zero_copy<W: WsService + Send>(
                     }
 
                     // Call on_message handler
-                   ws.on_message(stream, opcode, &payload_data, &mut ctx)?;
+                   ws.on_message(stream, opcode, &payload_data, &mut ctx, &path)?;
                 },
                 0x8 => {
                     // Close frame
@@ -459,7 +459,7 @@ fn handle_websocket_frames_zero_copy<W: WsService + Send>(
                     }
 
                     // Call on_close and send response
-                    ws.on_close(stream, code, reason, &mut ctx)?;
+                    ws.on_close(stream, code, reason, &mut ctx, &path)?;
                     ctx.send_frame(stream, 0x8, &[])?;
                     return Ok(());
                 },
