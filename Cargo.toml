@@ -43,6 +43,7 @@ may_postgres = { git = "https://github.com/Xudong-Huang/may_postgres.git", defau
 
 [features]
 default = ["may/default"]
+ws = []
 
 [profile.release]
 opt-level = 3

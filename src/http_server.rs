@@ -14,7 +14,11 @@ use bytes::{BufMut, BytesMut};
 use may::io::WaitIo;
 use may::net::{TcpListener, TcpStream};
 use may::{coroutine, go};
+
+#[cfg(feature = "ws")]
 use base64::{engine::general_purpose, Engine as _};
+
+#[cfg(feature = "ws")]
 use sha1::{Digest, Sha1};
 
 macro_rules! t_c {
@@ -36,6 +40,7 @@ pub trait HttpService {
     fn call(&mut self, req: Request, rsp: &mut Response) -> io::Result<()>;
 }
 
+#[cfg(feature = "ws")]
 pub trait WsService: Send {
     /// Called when WebSocket connection is established
     fn on_connect(&mut self, stream: &mut TcpStream, ctx: &mut WsContext, path: &str) -> io::Result<()>;
@@ -48,11 +53,13 @@ pub trait WsService: Send {
 }
 
 // WebSocket context for sending messages
+#[cfg(feature = "ws")]
 pub struct WsContext<'a> {
     // stream: &'a mut TcpStream,
     write_buf: &'a mut BytesMut,
 }
 
+#[cfg(feature = "ws")]
 impl<'a> WsContext<'a> {
     /// Send text message
     pub fn send_text(&mut self, stream: &mut TcpStream, text: &str) -> io::Result<()> {
@@ -96,9 +103,13 @@ impl<'a> WsContext<'a> {
 
 pub trait HttpServiceFactory: Send + Sized + 'static {
     type Service: HttpService + Send;
+
+    #[cfg(feature = "ws")]
     type MyWsService: WsService + Send;
     // create a new http service for each connection
     fn new_service(&self, id: usize) -> Self::Service;
+
+    #[cfg(feature = "ws")]
     fn new_ws_service(&self) -> Self::MyWsService;
 
     /// Spawns the http service, binding to the given address
@@ -122,8 +133,13 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
                     let id = stream.as_raw_socket() as usize;
                     // t_c!(stream.set_nodelay(true));
                     let service = self.new_service(id);
+
+                    #[cfg(feature = "ws")]
                     let ws_service = self.new_ws_service();
+
                     let builder = may::coroutine::Builder::new().id(id);
+
+                    #[cfg(feature = "ws")]
                     go!(
                         builder,
                         move || if let Err(e) = each_connection_loop(&mut stream, service, ws_service) {
@@ -133,7 +149,15 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
                     )
                     .unwrap();
 
-
+                    #[cfg(not(feature = "ws"))]
+                    go!(
+                        builder,
+                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                            error!("service err = {:?}", e);
+                            stream.shutdown(std::net::Shutdown::Both).ok();
+                        }
+                    )
+                    .unwrap();
 
                 }
             }
@@ -201,9 +225,58 @@ pub(crate) fn reserve_buf(buf: &mut BytesMut) {
 /// this is the generic type http server
 /// with a type parameter that impl `HttpService` trait
 ///
+
+#[cfg(not(feature = "ws"))]
+pub struct HttpServer<T>(pub T);
+
+#[cfg(feature = "ws")]
 pub struct HttpServer<T, W>(pub T, pub W);
 
 #[cfg(unix)]
+#[cfg(not(feature = "ws"))]
+fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) -> io::Result<()> {
+    let mut req_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut body_buf = BytesMut::with_capacity(4096);
+
+    loop {
+        let read_blocked = nonblock_read(stream.inner_mut(), &mut req_buf)?;
+
+        // Process requests
+        loop {
+            let mut headers = [MaybeUninit::uninit(); request::MAX_HEADERS];
+            let req_result = request::decode(&mut headers, &mut req_buf, stream);
+
+            match req_result? {
+                Some(req) => {
+                   reserve_buf(&mut rsp_buf);
+                    let mut rsp = Response::new(&mut body_buf);
+                    match service.call(req, &mut rsp) {
+                        Ok(()) => response::encode(rsp, &mut rsp_buf),
+                        Err(e) => {
+                            eprintln!("service err = {:?}", e);
+                            response::encode_error(e, &mut rsp_buf);
+                        }
+                    }
+
+                    req_buf.clear();
+                },
+                None => break,
+            }
+        }
+
+        nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+
+        if read_blocked {
+            stream.wait_io();
+        }
+    }
+}
+
+
+
+#[cfg(unix)]
+#[cfg(feature = "ws")]
 fn each_connection_loop<T: HttpService, W: WsService>(stream: &mut TcpStream, mut service: T, mut ws_service: W) -> io::Result<()> {
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
@@ -288,6 +361,7 @@ fn each_connection_loop<T: HttpService, W: WsService>(stream: &mut TcpStream, mu
     }
 }
 
+#[cfg(feature = "ws")]
  fn get_websocket_key<'a>(req: &'a Request<'a, 'a, 'a>) -> Option<&'a [u8]> {
     for header in req.headers() {
         if header.name.eq_ignore_ascii_case("Sec-WebSocket-Key") {
@@ -297,6 +371,7 @@ fn each_connection_loop<T: HttpService, W: WsService>(stream: &mut TcpStream, mu
     None
 }
 
+#[cfg(feature = "ws")]
 fn is_websocket_upgrade(req: &Request) -> bool {
     let has_connection_upgrade = req.headers().iter()
         .any(|h| h.name.eq_ignore_ascii_case("Connection") &&
@@ -318,7 +393,7 @@ fn is_websocket_upgrade(req: &Request) -> bool {
         .any(|h| h.name.eq_ignore_ascii_case("Sec-WebSocket-Key"))
 }
 
-
+#[cfg(feature = "ws")]
 fn handle_websocket_frames_zero_copy<W: WsService + Send>(
     stream: &mut TcpStream,
     read_buf: &mut BytesMut,
@@ -496,7 +571,9 @@ fn handle_websocket_frames_zero_copy<W: WsService + Send>(
     }
 }
 
+
 // Improved nonblock_read2 function
+#[cfg(feature = "ws")]
 fn nonblock_read2(stream: &mut impl Read, req_buf: &mut BytesMut) -> io::Result<bool> {
     reserve_buf(req_buf);
     let read_buf: &mut [u8] = unsafe { std::mem::transmute(req_buf.chunk_mut()) };
@@ -560,6 +637,33 @@ fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, mut service: T) 
     }
 }
 
+#[cfg(not(feature = "ws"))]
+impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
+    /// Spawns the http service, binding to the given address
+    /// return a coroutine that you can cancel it when need to stop the service
+    pub fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
+        let listener = TcpListener::bind(addr)?;
+        let service = self.0;
+        go!(
+            coroutine::Builder::new().name("TcpServer".to_owned()),
+            move || {
+                for stream in listener.incoming() {
+                    let mut stream = t_c!(stream);
+                    // t_c!(stream.set_nodelay(true));
+                    let service = service.clone();
+                    go!(
+                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                            error!("service err = {:?}", e);
+                            stream.shutdown(std::net::Shutdown::Both).ok();
+                        }
+                    );
+                }
+            }
+        )
+    }
+}
+
+#[cfg(feature = "ws")]
 impl<T: HttpService + Clone + Send + Sync + 'static, W: WsService + Clone + Send + Sync + 'static> HttpServer<T, W> {
     /// Spawns the http service, binding to the given address
     /// return a coroutine that you can cancel it when need to stop the service
